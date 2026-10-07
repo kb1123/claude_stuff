@@ -23,7 +23,21 @@ jobs:
           gradle-version: 8.9
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Publish build log
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete buildlog --yes --cleanup-tag || true
+          gh release create buildlog build.log \
+            --title "Latest build log" \
+            --notes "Compiler output of the most recent build" \
+            --prerelease \
+            --target "${GITHUB_SHA}"
 
       - uses: actions/upload-artifact@v4
         with:
