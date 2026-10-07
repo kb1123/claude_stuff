@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -27,3 +29,14 @@ jobs:
         with:
           name: SuperZoom-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK as the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk SuperZoom.apk
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest SuperZoom.apk \
+            --title "Super Zoom (latest build)" \
+            --notes "Debug APK built from commit ${GITHUB_SHA}" \
+            --target "${GITHUB_SHA}"
