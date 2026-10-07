@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Super Zoom</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee;
+    font: 15px/1.3 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; height: 100dvh; }
+  #stage { position: relative; flex: 1; min-height: 0; background: #111; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+  #hud { position: absolute; left: 8px; top: 8px; padding: 4px 8px; border-radius: 6px;
+    background: rgba(0,0,0,.55); font-size: 12px; pointer-events: none; white-space: pre; }
+  #cross { position: absolute; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px;
+    border: 1px solid rgba(255,255,255,.35); border-radius: 50%; pointer-events: none; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px;
+    align-items: center; justify-content: center; text-align: center; padding: 24px; background: #111; }
+  #overlay p { max-width: 32ch; color: #aaa; margin: 0; }
+  #err { color: #ff8a80; }
+  #controls { padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); background: #181818;
+    display: flex; flex-direction: column; gap: 10px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row.wrap { flex-wrap: wrap; }
+  select, button { font: inherit; color: #eee; background: #2a2a2a; border: 1px solid #3a3a3a;
+    border-radius: 8px; padding: 9px 12px; }
+  button:active { background: #3a3a3a; }
+  button.primary { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  button:disabled { opacity: .45; }
+  select { flex: 1; min-width: 0; }
+  input[type=range] { flex: 1; height: 36px; }
+  #zval { min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  label.chk { display: flex; align-items: center; gap: 6px; color: #ccc; }
+  .presets button { padding: 7px 10px; flex: 1; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="cross"></div>
+  <div id="hud"></div>
+  <div id="overlay">
+    <h2 style="margin:0">Super Zoom</h2>
+    <p>Digital zoom up to 200&times; with pan, freeze, multi-frame stacking and sharpening.</p>
+    <button id="startBtn" class="primary">Start camera</button>
+    <p id="err"></p>
+  </div>
+</div>
+
+<div id="controls">
+  <div class="row">
+    <select id="camSel" aria-label="Camera"></select>
+    <button id="resetBtn">Reset</button>
+  </div>
+  <div class="row">
+    <input id="zoom" type="range" min="0" max="1000" value="0" aria-label="Zoom">
+    <div id="zval">1.0&times;</div>
+  </div>
+  <div class="row presets">
+    <button data-z="1">1&times;</button>
+    <button data-z="5">5&times;</button>
+    <button data-z="20">20&times;</button>
+    <button data-z="50">50&times;</button>
+    <button data-z="100">100&times;</button>
+    <button data-z="200">200&times;</button>
+  </div>
+  <div class="row wrap">
+    <button id="freezeBtn">Freeze</button>
+    <button id="stackBtn">Stack &times;16</button>
+    <button id="saveBtn">Save</button>
+    <label class="chk"><input type="checkbox" id="sharpen"> Sharpen</label>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d', { willReadFrequently: true });
+const stage = $('stage');
+const video = document.createElement('video');
+video.playsInline = true; video.muted = true;
+
+let stream = null, track = null, caps = {};
+let nativeApplied = 1;          // optical/hardware zoom currently in effect
+let Z = 1;                       // total requested zoom (1..200)
+let cx = 0.5, cy = 0.5;          // crop centre, normalised 0..1
+let frozen = false, stacking = false, sharpen = false;
+const MAXZ = 200;
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+/* ---------- canvas sizing ---------- */
+function sizeCanvas() {
+  const r = stage.getBoundingClientRect();
+  const s = Math.min(1, 900 / Math.max(1, r.width));
+  cv.width = Math.max(2, Math.round(r.width * s));
+  cv.height = Math.max(2, Math.round(r.height * s));
+  if (!frozen && !stacking) draw(true);
+}
+new ResizeObserver(sizeCanvas).observe(stage);
+
+/* ---------- crop maths ---------- */
+function cropRect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const ca = cv.width / cv.height, va = vw / vh;
+  let bw, bh;
+  if (ca > va) { bw = vw; bh = vw / ca; } else { bh = vh; bw = vh * ca; }
+  const D = Math.max(1, Z / nativeApplied);
+  const w = bw / D, h = bh / D;
+  const x = clamp(cx * vw - w / 2, 0, vw - w);
+  const y = clamp(cy * vh - h / 2, 0, vh - h);
+  return { x, y, w, h, D, vw, vh };
+}
+
+/* ---------- drawing ---------- */
+function draw(withSharpen) {
+  if (video.readyState < 2 || !video.videoWidth) return;
+  const r = cropRect();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, cv.width, cv.height);
+  if (withSharpen && sharpen) doSharpen();
+  $('hud').textContent =
+    `${Z.toFixed(1)}×  (hardware ${nativeApplied.toFixed(1)}× + digital ${r.D.toFixed(1)}×)\n` +
+    `source ${r.vw}×${r.vh}, crop ${Math.round(r.w)}×${Math.round(r.h)}px`;
+}
+
+function doSharpen() {
+  const w = cv.width, h = cv.height;
+  const img = ctx.getImageData(0, 0, w, h);
+  const s = img.data, o = new Uint8ClampedArray(s), a = 0.7, w4 = w * 4;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = (y * w + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        const j = i + c, v = s[j];
+        o[j] = v + a * (4 * v - s[j - 4] - s[j + 4] - s[j - w4] - s[j + w4]);
+      }
+    }
+  }
+  img.data.set(o);
+  ctx.putImageData(img, 0, 0);
+}
+
+function loop() {
+  if (!frozen && !stacking && stream) draw(true);
+  requestAnimationFrame(loop);
+}
+
+/* ---------- zoom ---------- */
+let nTimer;
+function applyNative() {
+  clearTimeout(nTimer);
+  nTimer = setTimeout(async () => {
+    if (!track || !caps.zoom) return;
+    const lo = caps.zoom.min || 1;
+    const t = clamp(Z, lo, caps.zoom.max);
+    if (Math.abs(t - nativeApplied) < 0.02) return;
+    try {
+      await track.applyConstraints({ advanced: [{ zoom: t }] });
+      nativeApplied = track.getSettings().zoom || t;
+    } catch (e) { /* hardware zoom unsupported; digital only */ }
+  }, 80);
+}
+
+function setZoom(z) {
+  Z = clamp(z, 1, MAXZ);
+  $('zoom').value = Math.round(Math.log(Z) / Math.log(MAXZ) * 1000);
+  $('zval').textContent = Z.toFixed(Z < 10 ? 1 : 0) + '×';
+  applyNative();
+  if (frozen) { frozen = false; updateButtons(); }
+}
+
+$('zoom').addEventListener('input', e => setZoom(Math.pow(MAXZ, e.target.value / 1000)));
+document.querySelectorAll('.presets button').forEach(b =>
+  b.addEventListener('click', () => setZoom(+b.dataset.z)));
+$('resetBtn').addEventListener('click', () => { cx = cy = 0.5; setZoom(1); });
+
+/* ---------- pan + pinch ---------- */
+const ptrs = new Map();
+let pinchStart = null;
+cv.addEventListener('pointerdown', e => {
+  cv.setPointerCapture(e.pointerId);
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()];
+    pinchStart = { d: Math.hypot(a.x - b.x, a.y - b.y), z: Z };
+  }
+});
+cv.addEventListener('pointermove', e => {
+  const p = ptrs.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX; p.y = e.clientY;
+  if (ptrs.size === 1) {
+    if (video.videoWidth) {
+      const r = cropRect(), box = cv.getBoundingClientRect();
+      cx = clamp(cx - dx * (r.w / box.width) / r.vw, 0, 1);
+      cy = clamp(cy - dy * (r.h / box.height) / r.vh, 0, 1);
+      if (frozen) { frozen = false; updateButtons(); }
+    }
+  } else if (ptrs.size === 2 && pinchStart) {
+    const [a, b] = [...ptrs.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    setZoom(pinchStart.z * d / pinchStart.d);
+  }
+});
+const endPtr = e => { ptrs.delete(e.pointerId); pinchStart = null; };
+cv.addEventListener('pointerup', endPtr);
+cv.addEventListener('pointercancel', endPtr);
+cv.addEventListener('wheel', e => { e.preventDefault(); setZoom(Z * (e.deltaY < 0 ? 1.1 : 1 / 1.1)); }, { passive: false });
+
+/* ---------- camera ---------- */
+function stopStream() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; track = null;
+}
+
+async function listCameras() {
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const sel = $('camSel');
+  sel.innerHTML = '';
+  devs.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId;
+    o.textContent = d.label || ('Camera ' + (i + 1));
+    sel.appendChild(o);
+  });
+  const cur = track && track.getSettings().deviceId;
+  if (cur) sel.value = cur;
+}
+
+async function start(deviceId) {
+  stopStream();
+  const res = { width: { ideal: 4096 }, height: { ideal: 2160 } };
+  const v = deviceId
+    ? { deviceId: { exact: deviceId }, ...res }
+    : { facingMode: { ideal: 'environment' }, ...res };
+  stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: v });
+  video.srcObject = stream;
+  await video.play();
+  track = stream.getVideoTracks()[0];
+  caps = track.getCapabilities ? track.getCapabilities() : {};
+  nativeApplied = (track.getSettings().zoom) || 1;
+  cx = cy = 0.5; frozen = false; stacking = false;
+  setZoom(1);
+  updateButtons();
+  await listCameras();
+}
+
+$('startBtn').addEventListener('click', async () => {
+  $('err').textContent = '';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('err').textContent = 'Camera access needs a secure page (https://). Host this file over HTTPS and open it there.';
+    return;
+  }
+  try {
+    await start();
+    $('overlay').style.display = 'none';
+    sizeCanvas();
+  } catch (e) {
+    $('err').textContent = 'Could not open the camera: ' + (e.message || e.name);
+  }
+});
+
+$('camSel').addEventListener('change', async e => {
+  try { await start(e.target.value); } catch (err) { alert('Could not switch camera: ' + err.message); }
+});
+
+/* ---------- freeze / stack / save ---------- */
+const nextFrame = () => new Promise(r =>
+  video.requestVideoFrameCallback ? video.requestVideoFrameCallback(() => r()) : requestAnimationFrame(() => r()));
+
+function updateButtons() {
+  $('freezeBtn').textContent = frozen ? 'Resume' : 'Freeze';
+  $('stackBtn').disabled = stacking || !stream;
+  $('freezeBtn').disabled = stacking || !stream;
+  $('saveBtn').disabled = !stream;
+  if (!stacking) $('stackBtn').innerHTML = 'Stack &times;16';
+}
+
+$('freezeBtn').addEventListener('click', () => { frozen = !frozen; updateButtons(); });
+$('sharpen').addEventListener('change', e => { sharpen = e.target.checked; });
+
+$('stackBtn').addEventListener('click', async () => {
+  if (!stream || stacking) return;
+  frozen = false; stacking = true; updateButtons();
+  const N = 16, w = cv.width, h = cv.height;
+  const acc = new Float32Array(w * h * 4);
+  for (let i = 0; i < N; i++) {
+    await nextFrame();
+    draw(false);
+    const d = ctx.getImageData(0, 0, w, h).data;
+    for (let k = 0; k < d.length; k++) acc[k] += d[k];
+    $('stackBtn').textContent = `Stacking ${i + 1}/${N}`;
+  }
+  const img = ctx.createImageData(w, h);
+  for (let k = 0; k < acc.length; k++) img.data[k] = acc[k] / N;
+  ctx.putImageData(img, 0, 0);
+  if (sharpen) doSharpen();
+  stacking = false; frozen = true; updateButtons();
+});
+
+$('saveBtn').addEventListener('click', () => {
+  // Inside the Android app, hand the PNG to native code (WebView can't save blob downloads).
+  if (window.SuperZoomNative) {
+    window.SuperZoomNative.savePng(cv.toDataURL('image/png'));
+    return;
+  }
+  cv.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = `zoom-${Z.toFixed(0)}x-${Date.now()}.png`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }, 'image/png');
+});
+
+updateButtons();
+sizeCanvas();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
