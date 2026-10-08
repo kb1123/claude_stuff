@@ -6,7 +6,9 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.ImageFormat;
 import android.graphics.Matrix;
 import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
@@ -15,13 +17,17 @@ import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.Image;
+import android.media.ImageReader;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -49,7 +55,9 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -60,17 +68,24 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 
 /**
- * Super Zoom: native Camera2 viewfinder with every back lens selectable and zoom up to 200x.
+ * Super Zoom: native Camera2 viewfinder with zoom up to 200x.
  *
- * Zoom is split in two. The camera hardware crops the sensor as far as it allows (real detail),
- * and the GPU scales the preview texture for the rest. The preview matrix is computed from the
- * crop region the camera reports it actually applied, so the image never jumps while zooming.
+ * Lenses: every back lens Android exposes is listed. Many phones expose only one camera to apps
+ * and switch between ultra-wide, main and telephoto lenses themselves as the hardware zoom ratio
+ * changes, so zoom is driven through CONTROL_ZOOM_RATIO when the phone supports it.
+ *
+ * Zoom is split in two. The camera does as much as it allows in hardware (real detail), and the
+ * GPU scales the preview for the rest. The preview matrix is computed from the zoom the camera
+ * reports it actually applied, so the image never jumps while zooming.
+ *
+ * Capture takes a real JPEG still through the camera pipeline, not a copy of the preview.
  */
 public class MainActivity extends Activity {
 
     private static final int REQ_CAMERA = 1;
     private static final float MAX_ZOOM = 200f;
     private static final int[] RES_MP = {2, 5, 12};
+    private static final long STILL_MAX_PIXELS = 16000000L;
 
     /** One selectable lens. Physical lenses hidden behind a logical camera have a parentId. */
     private static class Lens {
@@ -80,6 +95,9 @@ public class MainActivity extends Activity {
         CameraCharacteristics reqCh; // characteristics of the camera we actually open
         String label;
         float eqFocal = 999f;
+        boolean ratioMode = false; // zoom through CONTROL_ZOOM_RATIO (Android 11+)
+        float zMin = 1f;           // lowest hardware zoom (below 1 means an ultra-wide lens)
+        float zMaxHw = 1f;         // highest hardware zoom ratio
 
         boolean direct() { return parentId == null; }
         String openId() { return parentId != null ? parentId : id; }
@@ -122,6 +140,7 @@ public class MainActivity extends Activity {
     private TextView zoomLabel;
     private Spinner lensSpinner;
     private SeekBar zoomBar;
+    private LinearLayout presetRow;
     private Button resBtn;
     private Button sharpBtn;
     private ScaleGestureDetector scaleDetector;
@@ -133,10 +152,16 @@ public class MainActivity extends Activity {
     private volatile int generation = 0;
     private volatile float zoom = 1f;
     private volatile float cx = 0.5f, cy = 0.5f; // window centre, display-normalised 0..1
-    // crop the camera reports it applied, display-normalised
+    // area of the baseline (1x) field of view the camera currently shows, display-normalised
     private volatile float ax0 = 0f, ay0 = 0f, ax1 = 1f, ay1 = 1f;
     private volatile boolean sharpen = false;
     private volatile Size previewSize;
+    private volatile Size stillSize;
+    private volatile boolean stillReady = false;
+    private volatile boolean useStill = true;
+    private volatile boolean capturing = false;
+    private volatile float stillG = 1f, stillOx = 0f, stillOy = 0f;
+    private volatile int stillOrientation = 0;
     private int resIndex = 1;
     private float curG = 1f, curOx = 0f, curOy = 0f;
     private String lastHud = "";
@@ -150,6 +175,7 @@ public class MainActivity extends Activity {
     private CameraCaptureSession session;
     private CaptureRequest.Builder builder;
     private Surface previewSurface;
+    private ImageReader stillReader;
 
     private final List<Lens> lenses = new ArrayList<>();
     private final Runnable updateRunnable = new Runnable() {
@@ -159,6 +185,10 @@ public class MainActivity extends Activity {
     private final Runnable matrixRunnable = new Runnable() {
         @Override
         public void run() { updateMatrix(); }
+    };
+    private final Runnable takeStillRunnable = new Runnable() {
+        @Override
+        public void run() { takeStill(); }
     };
 
     // =====================================================================================
@@ -230,11 +260,22 @@ public class MainActivity extends Activity {
         Button b = new Button(this);
         b.setText(text);
         b.setAllCaps(false);
-        b.setTextSize(14f);
-        b.setPadding(dp(4), 0, dp(4), 0);
+        b.setTextSize(13f);
+        b.setPadding(dp(2), 0, dp(2), 0);
         b.setMinWidth(0);
         b.setMinimumWidth(0);
         return b;
+    }
+
+    private static String fmtZoom(float v) {
+        if (Math.abs(v - Math.round(v)) < 0.05f || v >= 10f) {
+            return String.format(Locale.US, "%.0fx", v);
+        }
+        return String.format(Locale.US, "%.1fx", v);
+    }
+
+    private String resLabel() {
+        return "Live: " + RES_MP[resIndex] + "MP";
     }
 
     private void buildUi() {
@@ -284,28 +325,19 @@ public class MainActivity extends Activity {
         zoomLabel.setTextColor(Color.WHITE);
         zoomLabel.setTextSize(16f);
         zoomLabel.setGravity(Gravity.END);
-        zoomLabel.setText("1.0x");
+        zoomLabel.setText("1x");
         zoomRow.addView(zoomLabel, new LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT));
         controls.addView(zoomRow);
 
-        // presets
-        LinearLayout presets = new LinearLayout(this);
-        presets.setOrientation(LinearLayout.HORIZONTAL);
-        final float[] values = {1f, 5f, 20f, 50f, 100f, 200f};
-        for (final float v : values) {
-            Button b = makeButton(((int) v) + "x");
-            b.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View view) { setZoom(v); }
-            });
-            presets.addView(b, new LinearLayout.LayoutParams(0, dp(44), 1f));
-        }
-        controls.addView(presets);
+        // zoom presets (rebuilt for each lens, see buildPresets)
+        presetRow = new LinearLayout(this);
+        presetRow.setOrientation(LinearLayout.HORIZONTAL);
+        controls.addView(presetRow);
 
         // actions
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        resBtn = makeButton("Res: " + RES_MP[resIndex] + "MP");
+        resBtn = makeButton(resLabel());
         sharpBtn = makeButton("Sharpen: off");
         Button capBtn = makeButton("Capture");
         actions.addView(resBtn, new LinearLayout.LayoutParams(0, dp(48), 1f));
@@ -347,7 +379,9 @@ public class MainActivity extends Activity {
         zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
-                if (fromUser) setZoom((float) Math.pow(MAX_ZOOM, p / 1000.0));
+                if (!fromUser) return;
+                float zm = zoomMin();
+                setZoom((float) (zm * Math.pow(MAX_ZOOM / zm, p / 1000.0)));
             }
 
             @Override
@@ -398,7 +432,7 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View view) {
                 resIndex = (resIndex + 1) % RES_MP.length;
-                resBtn.setText("Res: " + RES_MP[resIndex] + "MP");
+                resBtn.setText(resLabel());
                 if (lens != null) restartCamera();
             }
         });
@@ -414,6 +448,28 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View view) { capture(); }
         });
+    }
+
+    /** Zoom shortcuts. Includes the ultra-wide end when this camera zooms out below 1x. */
+    private void buildPresets() {
+        presetRow.removeAllViews();
+        List<Float> values = new ArrayList<>();
+        float zm = zoomMin();
+        if (zm < 0.95f) values.add(zm);
+        values.add(1f);
+        values.add(3f);
+        values.add(5f);
+        values.add(10f);
+        values.add(50f);
+        values.add(200f);
+        for (final Float v : values) {
+            Button b = makeButton(fmtZoom(v));
+            b.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) { setZoom(v); }
+            });
+            presetRow.addView(b, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        }
     }
 
     // =====================================================================================
@@ -439,6 +495,17 @@ public class MainActivity extends Activity {
         l.parentId = parentId;
         l.ch = ch;
         l.reqCh = reqCh;
+
+        // hardware zoom range: on many phones this is how apps reach the other lenses
+        if (parentId == null && Build.VERSION.SDK_INT >= 30) {
+            Range<Float> zr = ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+            if (zr != null && zr.getUpper() > 0f) {
+                l.ratioMode = true;
+                l.zMin = Math.max(0.1f, Math.min(1f, zr.getLower()));
+                l.zMaxHw = Math.max(1f, zr.getUpper());
+            }
+        }
+
         String via = parentId == null ? "" : " via " + parentId;
         float[] fl = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
         SizeF ps = ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
@@ -518,19 +585,27 @@ public class MainActivity extends Activity {
             public void onNothingSelected(AdapterView<?> parent) { }
         });
         selectLens(lenses.get(def));
+
+        Lens l0 = lens;
+        if (lenses.size() <= 1 && l0 != null && l0.ratioMode && (l0.zMin < 0.95f || l0.zMaxHw >= 2.5f)) {
+            toast(String.format(Locale.US,
+                    "This phone shows apps one camera and switches lenses itself as you zoom "
+                            + "(%.1fx to %.0fx). Use the zoom buttons to reach the other lenses.",
+                    l0.zMin, l0.zMaxHw));
+        }
     }
 
     private void selectLens(Lens l) {
         lens = l;
-        zoom = 1f;
         cx = 0.5f;
         cy = 0.5f;
         ax0 = 0f;
         ay0 = 0f;
         ax1 = 1f;
         ay1 = 1f;
-        zoomBar.setProgress(0);
-        zoomLabel.setText("1.0x");
+        useStill = true;
+        buildPresets();
+        setZoom(1f);
         restartCamera();
     }
 
@@ -542,17 +617,30 @@ public class MainActivity extends Activity {
         return Math.max(lo, Math.min(hi, v));
     }
 
+    private float zoomMin() {
+        Lens l = lens;
+        return l == null ? 1f : l.zMin;
+    }
+
     private void clampCenter() {
         float s = 1f / zoom;
-        cx = clampF(cx, s / 2f, 1f - s / 2f);
-        cy = clampF(cy, s / 2f, 1f - s / 2f);
+        if (s >= 1f) {
+            cx = 0.5f;
+            cy = 0.5f;
+        } else {
+            cx = clampF(cx, s / 2f, 1f - s / 2f);
+            cy = clampF(cy, s / 2f, 1f - s / 2f);
+        }
     }
 
     private void setZoom(float z) {
-        zoom = clampF(z, 1f, MAX_ZOOM);
+        float zm = zoomMin();
+        zoom = clampF(z, zm, MAX_ZOOM);
         clampCenter();
-        zoomBar.setProgress(Math.round((float) (1000.0 * Math.log(zoom) / Math.log(MAX_ZOOM))));
-        zoomLabel.setText(String.format(Locale.US, zoom < 10f ? "%.1fx" : "%.0fx", zoom));
+        double span = Math.log(MAX_ZOOM / zm);
+        int progress = span <= 0.0 ? 0 : (int) Math.round(1000.0 * Math.log(zoom / zm) / span);
+        zoomBar.setProgress(progress);
+        zoomLabel.setText(fmtZoom(zoom));
         updateMatrix();
         requestCamUpdate();
     }
@@ -573,7 +661,7 @@ public class MainActivity extends Activity {
         camHandler.post(updateRunnable);
     }
 
-    /** Scales the preview texture to cover whatever the camera crop did not already provide. */
+    /** Scales the preview texture to cover whatever the camera zoom did not already provide. */
     private void updateMatrix() {
         int vw = tv.getWidth();
         int vh = tv.getHeight();
@@ -605,10 +693,18 @@ public class MainActivity extends Activity {
 
         Lens l = lens;
         Size ps = previewSize;
-        String text = String.format(Locale.US, "%.1fx  =  camera %.1fx + digital %.1fx\n%s%s",
-                zoom, 1f / aw, g,
-                l == null ? "" : l.label,
-                ps == null ? "" : "\npreview " + ps.getWidth() + "x" + ps.getHeight());
+        Size ss = stillSize;
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format(Locale.US, "%.1fx  =  camera %.1fx + digital %.1fx", zoom, 1f / aw, g));
+        if (l != null) {
+            sb.append('\n').append(l.label);
+            if (l.ratioMode) {
+                sb.append(String.format(Locale.US, "\ncamera zoom range %.1fx to %.0fx", l.zMin, l.zMaxHw));
+            }
+        }
+        if (ps != null) sb.append("\nlive ").append(ps.getWidth()).append('x').append(ps.getHeight());
+        if (ss != null && stillReady) sb.append("   photo ").append(ss.getWidth()).append('x').append(ss.getHeight());
+        String text = sb.toString();
         if (!text.equals(lastHud)) {
             lastHud = text;
             hud.setText(text);
@@ -680,6 +776,24 @@ public class MainActivity extends Activity {
         return sizes[sizes.length - 1];
     }
 
+    /** Largest JPEG size with the sensor's shape, capped so the photo stream stays dependable. */
+    private Size pickStillSize(CameraCharacteristics c) {
+        StreamConfigurationMap map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        Size[] sizes = map == null ? null : map.getOutputSizes(ImageFormat.JPEG);
+        if (sizes == null || sizes.length == 0) return null;
+        Rect active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        double want = active != null ? (double) active.width() / active.height() : 4.0 / 3.0;
+        Size best = null;
+        for (Size s : sizes) {
+            double diff = Math.abs((double) s.getWidth() / s.getHeight() - want);
+            long px = (long) s.getWidth() * s.getHeight();
+            if (diff < 0.03 && px <= STILL_MAX_PIXELS) {
+                if (best == null || px > (long) best.getWidth() * best.getHeight()) best = s;
+            }
+        }
+        return best;
+    }
+
     /** UI thread. (Re)opens the selected lens at the chosen preview resolution. */
     private void restartCamera() {
         final Lens l = lens;
@@ -697,6 +811,7 @@ public class MainActivity extends Activity {
         ay0 = 0f;
         ax1 = 1f;
         ay1 = 1f;
+        stillReady = false;
         camHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -725,6 +840,11 @@ public class MainActivity extends Activity {
             previewSurface.release();
             previewSurface = null;
         }
+        if (stillReader != null) {
+            stillReader.close();
+            stillReader = null;
+        }
+        stillReady = false;
     }
 
     private void openInternal(final Lens l, final Size size, final int gen) {
@@ -765,11 +885,28 @@ public class MainActivity extends Activity {
             if (st == null || camDevice == null) return;
             st.setDefaultBufferSize(size.getWidth(), size.getHeight());
             previewSurface = new Surface(st);
-            OutputConfiguration oc = new OutputConfiguration(previewSurface);
-            if (!l.direct()) oc.setPhysicalCameraId(l.id);
+
+            List<OutputConfiguration> outputs = new ArrayList<>();
+            OutputConfiguration previewOut = new OutputConfiguration(previewSurface);
+            if (!l.direct()) previewOut.setPhysicalCameraId(l.id);
+            outputs.add(previewOut);
+
+            // second output: a real JPEG still, so Capture is not just a copy of the preview
+            final boolean wantStill = useStill;
+            Size js = wantStill ? pickStillSize(l.ch) : null;
+            if (js != null) {
+                stillReader = ImageReader.newInstance(js.getWidth(), js.getHeight(), ImageFormat.JPEG, 2);
+                stillReader.setOnImageAvailableListener(stillListener, camHandler);
+                OutputConfiguration stillOut = new OutputConfiguration(stillReader.getSurface());
+                if (!l.direct()) stillOut.setPhysicalCameraId(l.id);
+                outputs.add(stillOut);
+            }
+            final boolean haveStill = js != null;
+            stillSize = js;
+
             SessionConfiguration sc = new SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
-                    Collections.singletonList(oc),
+                    outputs,
                     camExecutor,
                     new CameraCaptureSession.StateCallback() {
                         @Override
@@ -782,8 +919,10 @@ public class MainActivity extends Activity {
                             try {
                                 builder = camDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
                                 builder.addTarget(previewSurface);
-                                applyStaticSettings(l);
+                                applyStaticSettings(builder, l);
+                                stillReady = haveStill;
                                 updateRequest();
+                                ui.post(matrixRunnable);
                             } catch (Exception e) {
                                 toast("Could not start preview: " + e.getMessage());
                             }
@@ -797,8 +936,13 @@ public class MainActivity extends Activity {
                                     if (gen != generation) return;
                                     if (resIndex > 0) {
                                         resIndex--;
-                                        resBtn.setText("Res: " + RES_MP[resIndex] + "MP");
+                                        resBtn.setText(resLabel());
                                         toast("That resolution didn't work for this lens. Trying a lower one.");
+                                        restartCamera();
+                                    } else if (haveStill) {
+                                        useStill = false;
+                                        toast("Full-resolution photos aren't available on this lens. "
+                                                + "Capture will save the live view instead.");
                                         restartCamera();
                                     } else {
                                         toast("This lens could not be started.");
@@ -814,13 +958,13 @@ public class MainActivity extends Activity {
     }
 
     /** Settings that do not change while previewing: focus mode and a steady frame rate. */
-    private void applyStaticSettings(Lens l) {
+    private void applyStaticSettings(CaptureRequest.Builder b, Lens l) {
         CameraCharacteristics c = l.reqCh;
         int[] afModes = c.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
         if (contains(afModes, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
         }
-        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
         Range<Integer>[] ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
         if (ranges != null) {
             Range<Integer> best = null;
@@ -833,11 +977,42 @@ public class MainActivity extends Activity {
                     best = r;
                 }
             }
-            if (best != null) builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, best);
+            if (best != null) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, best);
         }
     }
 
-    /** Builds and sends the repeating request with the current zoom, pan and sharpen settings. */
+    /** Hardware part of the zoom: the zoom ratio when supported, otherwise a sensor crop region. */
+    private void applyZoom(CaptureRequest.Builder b, Lens l) {
+        if (!l.direct()) return; // hidden lenses are scaled on the GPU only
+        if (l.ratioMode) {
+            b.set(CaptureRequest.CONTROL_ZOOM_RATIO, clampF(zoom, l.zMin, l.zMaxHw));
+            return;
+        }
+        Rect active = l.ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        Float md = l.ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+        if (active == null) return;
+        float maxDz = md == null ? 1f : md;
+        float hwZ = Math.max(1f, Math.min(zoom, maxDz));
+        float hs = 1f / hwZ;
+        float hcx = clampF(cx, hs / 2f, 1f - hs / 2f);
+        float hcy = clampF(cy, hs / 2f, 1f - hs / 2f);
+        int o = l.orientation();
+        float[] p0 = displayToSensor(hcx - hs / 2f, hcy - hs / 2f, o);
+        float[] p1 = displayToSensor(hcx + hs / 2f, hcy + hs / 2f, o);
+        float sx0 = Math.min(p0[0], p1[0]);
+        float sx1 = Math.max(p0[0], p1[0]);
+        float sy0 = Math.min(p0[1], p1[1]);
+        float sy1 = Math.max(p0[1], p1[1]);
+        int aw = active.width();
+        int ah = active.height();
+        b.set(CaptureRequest.SCALER_CROP_REGION, new Rect(
+                active.left + Math.round(sx0 * aw),
+                active.top + Math.round(sy0 * ah),
+                active.left + Math.round(sx1 * aw),
+                active.top + Math.round(sy1 * ah)));
+    }
+
+    /** Builds and sends the repeating request with the current zoom and sharpen settings. */
     private void updateRequest() {
         final Lens l = lens;
         if (session == null || builder == null || l == null) return;
@@ -852,34 +1027,7 @@ public class MainActivity extends Activity {
             if (contains(rc.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES), nrMode)) {
                 builder.set(CaptureRequest.NOISE_REDUCTION_MODE, nrMode);
             }
-
-            if (l.direct()) {
-                // hardware crop as far as the camera allows; the GPU does the rest
-                Rect active = l.ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-                Float md = l.ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
-                if (active != null) {
-                    float maxDz = md == null ? 1f : md;
-                    float hwZ = Math.max(1f, Math.min(zoom, maxDz));
-                    float hs = 1f / hwZ;
-                    float hcx = clampF(cx, hs / 2f, 1f - hs / 2f);
-                    float hcy = clampF(cy, hs / 2f, 1f - hs / 2f);
-                    int o = l.orientation();
-                    float[] p0 = displayToSensor(hcx - hs / 2f, hcy - hs / 2f, o);
-                    float[] p1 = displayToSensor(hcx + hs / 2f, hcy + hs / 2f, o);
-                    float sx0 = Math.min(p0[0], p1[0]);
-                    float sx1 = Math.max(p0[0], p1[0]);
-                    float sy0 = Math.min(p0[1], p1[1]);
-                    float sy1 = Math.max(p0[1], p1[1]);
-                    int aw = active.width();
-                    int ah = active.height();
-                    Rect r = new Rect(
-                            active.left + Math.round(sx0 * aw),
-                            active.top + Math.round(sy0 * ah),
-                            active.left + Math.round(sx1 * aw),
-                            active.top + Math.round(sy1 * ah));
-                    builder.set(CaptureRequest.SCALER_CROP_REGION, r);
-                }
-            }
+            applyZoom(builder, l);
             session.setRepeatingRequest(builder.build(), captureCallback, camHandler);
         } catch (CameraAccessException | IllegalStateException e) {
             // session is closing or being replaced; ignore
@@ -893,20 +1041,32 @@ public class MainActivity extends Activity {
                                                TotalCaptureResult result) {
                     Lens l = lens;
                     if (l == null || !l.direct()) return;
-                    Rect cr = result.get(CaptureResult.SCALER_CROP_REGION);
-                    Rect active = l.ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-                    if (cr == null || active == null || active.width() == 0 || active.height() == 0) return;
-                    float nx0 = (cr.left - active.left) / (float) active.width();
-                    float nx1 = (cr.right - active.left) / (float) active.width();
-                    float ny0 = (cr.top - active.top) / (float) active.height();
-                    float ny1 = (cr.bottom - active.top) / (float) active.height();
-                    int o = l.orientation();
-                    float[] p0 = sensorToDisplay(nx0, ny0, o);
-                    float[] p1 = sensorToDisplay(nx1, ny1, o);
-                    float nax0 = Math.min(p0[0], p1[0]);
-                    float nax1 = Math.max(p0[0], p1[0]);
-                    float nay0 = Math.min(p0[1], p1[1]);
-                    float nay1 = Math.max(p0[1], p1[1]);
+                    float nax0, nax1, nay0, nay1;
+                    if (l.ratioMode) {
+                        // the camera shows 1/ratio of the baseline view, centred
+                        Float zr = result.get(CaptureResult.CONTROL_ZOOM_RATIO);
+                        if (zr == null || zr <= 0f) return;
+                        float half = 0.5f / zr;
+                        nax0 = 0.5f - half;
+                        nax1 = 0.5f + half;
+                        nay0 = nax0;
+                        nay1 = nax1;
+                    } else {
+                        Rect cr = result.get(CaptureResult.SCALER_CROP_REGION);
+                        Rect active = l.ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+                        if (cr == null || active == null || active.width() == 0 || active.height() == 0) return;
+                        float nx0 = (cr.left - active.left) / (float) active.width();
+                        float nx1 = (cr.right - active.left) / (float) active.width();
+                        float ny0 = (cr.top - active.top) / (float) active.height();
+                        float ny1 = (cr.bottom - active.top) / (float) active.height();
+                        int o = l.orientation();
+                        float[] p0 = sensorToDisplay(nx0, ny0, o);
+                        float[] p1 = sensorToDisplay(nx1, ny1, o);
+                        nax0 = Math.min(p0[0], p1[0]);
+                        nax1 = Math.max(p0[0], p1[0]);
+                        nay0 = Math.min(p0[1], p1[1]);
+                        nay1 = Math.max(p0[1], p1[1]);
+                    }
                     if (Math.abs(nax0 - ax0) > 0.0005f || Math.abs(nax1 - ax1) > 0.0005f
                             || Math.abs(nay0 - ay0) > 0.0005f || Math.abs(nay1 - ay1) > 0.0005f) {
                         ax0 = nax0;
@@ -923,14 +1083,118 @@ public class MainActivity extends Activity {
     // capture
     // =====================================================================================
 
-    /** Saves exactly what is on screen, using the sharpest frame the preview stream offers. */
     private void capture() {
-        Lens l = lens;
-        Size ps = previewSize;
-        if (l == null || ps == null || tv == null || !tv.isAvailable()) {
+        final Lens l = lens;
+        if (l == null || tv == null || !tv.isAvailable()) {
             toast("Camera is not ready yet.");
             return;
         }
+        if (capturing) return;
+        if (stillReady) {
+            capturing = true;
+            stillG = curG;
+            stillOx = curOx;
+            stillOy = curOy;
+            stillOrientation = l.orientation();
+            toast("Taking photo...");
+            camHandler.post(takeStillRunnable);
+        } else {
+            captureLiveFrame();
+        }
+    }
+
+    /** Camera thread. Fires a full-quality still with the same zoom as the preview. */
+    private void takeStill() {
+        final Lens l = lens;
+        try {
+            if (session == null || camDevice == null || stillReader == null || l == null) {
+                throw new IllegalStateException("camera not ready");
+            }
+            CaptureRequest.Builder sb = camDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+            sb.addTarget(stillReader.getSurface());
+            applyStaticSettings(sb, l);
+            applyZoom(sb, l);
+            CameraCharacteristics rc = l.reqCh;
+            if (contains(rc.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES),
+                    CaptureRequest.EDGE_MODE_HIGH_QUALITY)) {
+                sb.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY);
+            }
+            if (contains(rc.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES),
+                    CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                sb.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY);
+            }
+            sb.set(CaptureRequest.JPEG_QUALITY, (byte) 95);
+            sb.set(CaptureRequest.JPEG_ORIENTATION, l.orientation());
+            session.capture(sb.build(), new CameraCaptureSession.CaptureCallback() {
+                @Override
+                public void onCaptureFailed(CameraCaptureSession s, CaptureRequest r, CaptureFailure f) {
+                    capturing = false;
+                    toast("The camera could not take the photo.");
+                }
+            }, camHandler);
+        } catch (Exception e) {
+            capturing = false;
+            toast("Could not take photo: " + e.getMessage());
+        }
+    }
+
+    private final ImageReader.OnImageAvailableListener stillListener =
+            new ImageReader.OnImageAvailableListener() {
+                @Override
+                public void onImageAvailable(ImageReader reader) {
+                    Image img = null;
+                    try {
+                        img = reader.acquireNextImage();
+                        if (img == null) return;
+                        ByteBuffer buf = img.getPlanes()[0].getBuffer();
+                        final byte[] bytes = new byte[buf.remaining()];
+                        buf.get(bytes);
+                        img.close();
+                        img = null;
+                        final float g = stillG;
+                        final float ox = stillOx;
+                        final float oy = stillOy;
+                        final int orientation = stillOrientation;
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() { processStill(bytes, g, ox, oy, orientation); }
+                        }).start();
+                    } catch (Exception e) {
+                        if (img != null) img.close();
+                        capturing = false;
+                        toast("Could not read the photo: " + e.getMessage());
+                    }
+                }
+            };
+
+    /** Saves the photo as shot, or crops it first when the zoom went beyond the camera's own range. */
+    private void processStill(byte[] bytes, float g, float ox, float oy, int orientation) {
+        try {
+            if (g <= 1.02f) {
+                writeMedia(bytes);
+                toast("Saved to Pictures/SuperZoom");
+            } else {
+                Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                if (bmp == null) throw new IllegalStateException("could not decode the photo");
+                if (orientation != 0) {
+                    Matrix m = new Matrix();
+                    m.postRotate(orientation);
+                    bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+                }
+                cropAndSave(bmp, g, ox, oy);
+            }
+        } catch (Exception e) {
+            toast("Save failed: " + e.getMessage());
+        } finally {
+            capturing = false;
+        }
+    }
+
+    /** Fallback when the phone cannot run a photo stream: saves what the live view shows. */
+    private void captureLiveFrame() {
+        Lens l = lens;
+        Size ps = previewSize;
+        if (l == null || ps == null) return;
         final float g = curG;
         final float ox = curOx;
         final float oy = curOy;
@@ -957,37 +1221,44 @@ public class MainActivity extends Activity {
         final Bitmap frame = full;
         new Thread(new Runnable() {
             @Override
-            public void run() { saveCrop(frame, g, ox, oy); }
+            public void run() {
+                try {
+                    cropAndSave(frame, g, ox, oy);
+                } catch (Exception e) {
+                    toast("Save failed: " + e.getMessage());
+                }
+            }
         }).start();
     }
 
-    private void saveCrop(Bitmap full, float g, float ox, float oy) {
-        try {
-            int fw = full.getWidth();
-            int fh = full.getHeight();
-            int cw = Math.max(1, Math.min(fw, Math.round(fw / g)));
-            int ch = Math.max(1, Math.min(fh, Math.round(fh / g)));
-            int left = Math.max(0, Math.min(fw - cw, Math.round(fw * (0.5f + ox) - cw / 2f)));
-            int top = Math.max(0, Math.min(fh - ch, Math.round(fh * (0.5f + oy) - ch / 2f)));
-            Bitmap crop = Bitmap.createBitmap(full, left, top, cw, ch);
-            float up = Math.max(1f, 1080f / cw);
-            Bitmap out = up > 1.01f
-                    ? Bitmap.createScaledBitmap(crop, Math.round(cw * up), Math.round(ch * up), true)
-                    : crop;
+    private void cropAndSave(Bitmap full, float g, float ox, float oy) throws Exception {
+        int fw = full.getWidth();
+        int fh = full.getHeight();
+        int cw = Math.max(1, Math.min(fw, Math.round(fw / g)));
+        int ch = Math.max(1, Math.min(fh, Math.round(fh / g)));
+        int left = Math.max(0, Math.min(fw - cw, Math.round(fw * (0.5f + ox) - cw / 2f)));
+        int top = Math.max(0, Math.min(fh - ch, Math.round(fh * (0.5f + oy) - ch / 2f)));
+        Bitmap crop = Bitmap.createBitmap(full, left, top, cw, ch);
+        float up = Math.max(1f, 1080f / cw);
+        Bitmap out = up > 1.01f
+                ? Bitmap.createScaledBitmap(crop, Math.round(cw * up), Math.round(ch * up), true)
+                : crop;
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        out.compress(Bitmap.CompressFormat.JPEG, 95, bos);
+        writeMedia(bos.toByteArray());
+        toast("Saved to Pictures/SuperZoom");
+    }
 
-            ContentValues v = new ContentValues();
-            v.put(MediaStore.Images.Media.DISPLAY_NAME, "SuperZoom-" + System.currentTimeMillis() + ".jpg");
-            v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-            v.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/SuperZoom");
-            Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
-            if (uri == null) throw new IllegalStateException("could not create file");
-            try (OutputStream os = getContentResolver().openOutputStream(uri)) {
-                if (os == null) throw new IllegalStateException("could not open file");
-                out.compress(Bitmap.CompressFormat.JPEG, 95, os);
-            }
-            toast("Saved to Pictures/SuperZoom");
-        } catch (Exception e) {
-            toast("Save failed: " + e.getMessage());
+    private void writeMedia(byte[] jpeg) throws Exception {
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.Images.Media.DISPLAY_NAME, "SuperZoom-" + System.currentTimeMillis() + ".jpg");
+        v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        v.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/SuperZoom");
+        Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+        if (uri == null) throw new IllegalStateException("could not create file");
+        try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+            if (os == null) throw new IllegalStateException("could not open file");
+            os.write(jpeg);
         }
     }
 }
